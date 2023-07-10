@@ -1,273 +1,305 @@
-from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QPushButton, QLabel, QCheckBox, QLineEdit, QProgressBar, QStatusBar, QFileDialog, QHeaderView, QTableWidget, QTableWidgetItem, QMenu
-from PyQt6.QtCore import QRunnable, QObject, pyqtSignal, QThreadPool
-import sys
+from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget,QComboBox,QLabel, QPushButton, QCheckBox, QLineEdit, QProgressBar, QStatusBar, QFileDialog, QHeaderView, QTableWidget, QTableWidgetItem
+from PyQt6.QtCore import QRunnable, QObject, pyqtSignal, QThreadPool, Qt
+from PyQt6.QtGui import QAction
 import os
 import string
-from PyQt6.QtGui import QAction
-import ctypes
 import sqlite3
+import ctypes
+import time
+
+
+FILE_ATTRIBUTE_HIDDEN = 0x2
+FILE_ATTRIBUTE_SYSTEM = 0x4
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.db_manager = None
 
-        # Create the central widget and layout
+        self.scan_task = None
+
         self.central_widget = QWidget()
         self.layout = QVBoxLayout(self.central_widget)
 
-        # Create the GUI elements
+        self.scan_button = QPushButton("Start Scan")
+        self.scan_button.clicked.connect(self.start_scan)
+
+        self.progress_bar = QProgressBar()
+
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Filename", "Filepath", "Size", "Type", "Date Created", "Date Modified"])
+
         self.search_box = QLineEdit()
-        self.scan_button = QPushButton("Scan")
-        self.checkbox_system_files = QCheckBox("Include system files")
-        self.checkbox_hidden_files = QCheckBox("Include hidden files")
-        self.result_box = QTableWidget()
-        self.result_box.setColumnCount(5)  # Adjust this to fit your data
-        self.result_box.setHorizontalHeaderLabels(['nbr', 'Name', 'Path', 'Size', 'Type'])
-        self.result_box.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.result_box.setSortingEnabled(True)
+        self.search_box.returnPressed.connect(self.search_files)
 
-        # Add the elements to the layout
-        self.layout.addWidget(self.search_box)
+        self.system_files_checkbox = QCheckBox("Include system files")
+        self.hidden_files_checkbox = QCheckBox("Include hidden files")
+
         self.layout.addWidget(self.scan_button)
-        self.layout.addWidget(self.checkbox_system_files)
-        self.layout.addWidget(self.checkbox_hidden_files)
-        self.layout.addWidget(self.result_box)
+        self.stop_scan_button = QPushButton("Stop Scan")
+        self.stop_scan_button.clicked.connect(self.stop_scan)
+        self.layout.addWidget(self.stop_scan_button)
+        self.layout.addWidget(self.progress_bar)
+        self.layout.addWidget(self.system_files_checkbox)
+        self.layout.addWidget(self.hidden_files_checkbox)
+        self.layout.addWidget(self.table)
+        self.layout.addWidget(QLabel("Search:"))
+        self.layout.addWidget(self.search_box)
 
-        # Add central widget to main window
+
         self.setCentralWidget(self.central_widget)
 
-        # Create a status bar
+        self.db_conn = sqlite3.connect(":memory:")
+        self.db_cursor = self.db_conn.cursor()
+        self.db_cursor.execute("CREATE TABLE files (filename text, filepath text, size int, type text, date_created text, date_modified text)")
+
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
-        # Create actions for the file menu
         self.new_db_action = QAction("New Database", self)
-        self.open_db_action = QAction("Open Database", self)
-        self.save_db_action = QAction("Save Database", self)
+        self.new_db_action.triggered.connect(self.new_database)
 
-        # Create the file menu and add actions
+        self.open_db_action = QAction("Open Database", self)
+        self.open_db_action.triggered.connect(self.open_database)
+
+        self.save_db_action = QAction("Save Database", self)
+        self.save_db_action.triggered.connect(self.save_database)
+
         self.file_menu = self.menuBar().addMenu("File")
         self.file_menu.addAction(self.new_db_action)
         self.file_menu.addAction(self.open_db_action)
         self.file_menu.addAction(self.save_db_action)
 
-        # Connect the buttons and actions to methods
-        self.scan_button.clicked.connect(self.scan_drives)
-        self.new_db_action.triggered.connect(self.new_database)
-        self.open_db_action.triggered.connect(self.open_database)
-        self.save_db_action.triggered.connect(self.save_database)
 
-        self.search_box.returnPressed.connect(self.search_files)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setTextVisible(True)
+        self.sort_by_combo = QComboBox()
+        self.sort_by_combo.addItem("Filename", "filename")
+        self.sort_by_combo.addItem("Filepath", "filepath")
+        self.sort_by_combo.addItem("Size", "size")
+        self.sort_by_combo.addItem("Type", "type")
+        self.sort_by_combo.addItem("Date Created", "date_created")
+        self.sort_by_combo.addItem("Date Modified", "date_modified")
+        self.sort_by_combo.currentIndexChanged.connect(self.sort_files)
+        self.layout.addWidget(self.sort_by_combo)
 
-        self.layout.addWidget(self.progress_bar)
+        self.table.cellDoubleClicked.connect(self.open_file)
 
-    def get_drive_paths(self):
-        drive_paths = []
-        for letter in string.ascii_uppercase:
-            drive_path = f"{letter}:\\"
-            if os.path.exists(drive_path):
-                drive_paths.append(drive_path)
-        return drive_paths
+    def stop_scan(self):
+        if self.scan_task is not None:
+            self.scan_task.stop()
+            self.scan_task = None
+
+    def start_scan(self):
+        if self.db_conn is None:
+            self.status_bar.showMessage("No database selected!")
+            return
+
+        include_system_files = self.system_files_checkbox.isChecked()
+        include_hidden_files = self.hidden_files_checkbox.isChecked()
+
+        self.scan_task = ScanTask(include_system_files, include_hidden_files, size_min=1000, excluded_extensions=[".dat",".dll"])
+
+
+        self.scan_task.signals.file_found.connect(self.on_file_found)
+        self.scan_task.signals.progress.connect(self.on_progress)
+
+        thread_pool = QThreadPool.globalInstance()
+        thread_pool.start(self.scan_task)
+
+    def on_file_found(self, filename, filepath, size, type_, date_created, date_modified):
+        self.db_cursor.execute("INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)", (filename, filepath, size, type_, date_created, date_modified))
+        self.db_conn.commit()
+
+
+
+    def on_progress(self, value, maximum):
+        self.progress_bar.setMaximum(maximum)
+        self.progress_bar.setValue(value)
+
+    def search_files(self):
+        query = self.search_box.text()
+        self.db_cursor.execute("SELECT * FROM files WHERE filename LIKE ?", (f"%{query}%",))
+        results = self.db_cursor.fetchall()
+
+        self.update_table(results)
+
+    def sort_files(self):
+        sort_by = self.sort_by_combo.currentData()
+        self.db_cursor.execute(f"SELECT * FROM files ORDER BY {sort_by}")
+        results = self.db_cursor.fetchall()
+        self.update_table(results)
+
+    def update_table(self, data):
+        self.table.setRowCount(0)
+        for filename, filepath, size, type_, date_created, date_modified in data:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(filename))
+            self.table.setItem(row, 1, QTableWidgetItem(filepath))
+            self.table.setItem(row, 2, QTableWidgetItem(str(size)))
+            self.table.setItem(row, 3, QTableWidgetItem(type_))
+            self.table.setItem(row, 4, QTableWidgetItem(date_created))
+            self.table.setItem(row, 5, QTableWidgetItem(date_modified))
 
     def new_database(self):
         db_path, _ = QFileDialog.getSaveFileName(self, "New Database")
         if db_path:  # Ensure a file was selected
-            self.db_manager = DatabaseManager(db_path)
-            self.db_manager.create_table()
+            self.db_conn = sqlite3.connect(db_path)
+            self.db_cursor = self.db_conn.cursor()
+            self.db_cursor.execute("""
+                CREATE TABLE IF NOT EXISTS files (
+                    filename text,
+                    filepath text,
+                    size int,
+                    type text,
+                    date_created text,
+                    date_modified text
+                )
+            """)
+
             self.status_bar.showMessage(f"Created new database: {db_path}")
 
     def open_database(self):
         db_path, _ = QFileDialog.getOpenFileName(self, "Open Database")
         if db_path:  # Ensure a file was selected
-            self.db_manager = DatabaseManager(db_path)
+            self.db_conn = sqlite3.connect(db_path)
+            self.db_cursor = self.db_conn.cursor()
             self.status_bar.showMessage(f"Opened database: {db_path}")
 
     def save_database(self):
-        if self.db_manager is None:
+        if self.db_conn is None:
             self.status_bar.showMessage("No database selected!")
             return
 
-        self.db_manager.conn.commit()
+        self.db_conn.commit()
         self.status_bar.showMessage("Database saved!")
 
-    def scan_drives(self):
-        if self.db_manager is None:
-            self.status_bar.showMessage("No database selected!")
-            return
-
-        # Get the paths of the drives to scan
-        drive_paths = self.get_drive_paths()
-
-        # Estimate total files
-        total_files = sum(len(files) for path in drive_paths for _, _, files in os.walk(path))
-        self.progress_bar.setMaximum(total_files)
-
-        # Create the scan task
-        db_path = self.db_manager.conn.execute("PRAGMA database_list").fetchall()[0][2] if self.db_manager and self.db_manager.conn is not None else None
-        checkbox_system_files_state = self.checkbox_system_files.isChecked()
-        checkbox_hidden_files_state = self.checkbox_hidden_files.isChecked()
-
-        self.scan_task = ScanTask(drive_paths, db_path, checkbox_system_files_state, checkbox_hidden_files_state)
-        self.scan_task.signals.file_scanned.connect(self.on_file_scanned)
-        self.scan_task.signals.scan_completed.connect(self.on_scan_completed)
-
-        # Submit the task to the thread pool
-        thread_pool = QThreadPool.globalInstance()
-        thread_pool.start(self.scan_task)
-
-    def on_file_scanned(self, file_info):
-        self.progress_bar.setValue(self.progress_bar.value() + 1)
-        self.db_manager.insert_file(*file_info)
-
-        total_files = self.progress_bar.maximum()
-        if total_files != 0:
-            percentage = int((self.progress_bar.value() / total_files) * 100)
-            self.progress_bar.setFormat(f"{percentage}%")
-
-    def on_scan_completed(self):
-        self.status_bar.showMessage("Scan completed!")
-        self.search_files()
-        self.progress_bar.setFormat("%p%")
-
-    def search_files(self):
-        if self.db_manager is None:
-            self.status_bar.showMessage("No database selected!")
-            return
-
-        query = self.search_box.text()
-        results = self.db_manager.query_files(query)
-        self.result_box.setRowCount(0)  # Clear the table
-        for row_number, result in enumerate(results):
-            self.result_box.insertRow(row_number)  # Insert a new row
-            for column_number, data in enumerate(result):
-                if column_number == 3:  # If this is the size column
-                    data = round(data / 1024 / 1024, 2)  # Convert to MB
-                item = QTableWidgetItem(str(data))
-                self.result_box.setItem(row_number, column_number, item)  # Add data to the row
-
-    def closeEvent(self, event):
-        if self.db_manager is not None:
-            self.db_manager.close()
+    def open_file(self, row):
+        filepath = self.table.item(row, 1).text()  # Column 1 is the filepath
+        os.startfile(filepath)
 
 
 class ScanTaskSignals(QObject):
-    file_scanned = pyqtSignal(tuple)
-    scan_completed = pyqtSignal()
+    file_found = pyqtSignal(str, str, int, str, str, str)
+    progress = pyqtSignal(int, int)
+
 
 class ScanTask(QRunnable):
-    def __init__(self, paths, db_path, checkbox_system_files_state, checkbox_hidden_files_state):
+    def __init__(self, include_system_files, include_hidden_files, size_min=None, excluded_extensions=None):
         super().__init__()
-        self.paths = paths
-        self.db_path = db_path
-        self.checkbox_system_files_state = checkbox_system_files_state
-        self.checkbox_hidden_files_state = checkbox_hidden_files_state
+        self.include_system_files = include_system_files
+        self.include_hidden_files = include_hidden_files
+        self.size_min = size_min
+        self.excluded_extensions = excluded_extensions
         self.signals = ScanTaskSignals()
+        self._stop = False
 
     def run(self):
-        if self.db_path:
-            db_manager = DatabaseManager(self.db_path)
-        else:
-            db_manager = None
+        count = 0
+        for drive_letter in string.ascii_uppercase:
+            if os.path.exists(drive_letter + ":/"):
+                for dirpath, dirnames, filenames in os.walk(drive_letter + ":/"):
+                    if self._stop:  # Stop if the stop flag is set
+                        return
+                    for filename in filenames:
+                        if self._stop:  # Stop if the stop flag is set
+                            return
+                        try:
+                            filepath = os.path.join(dirpath, filename)
 
-        total_files = 0
-        batch = []
-        for path in self.paths:
-            for file in self.scan_dir(path):
-                batch.append(file)
-                if len(batch) >= 1000:  # Adjust batch size as needed
-                    db_manager.insert_files(batch)
-                    batch = []
+                            if (os.path.isfile(filepath) and
+                                    (self.include_system_files or not self.is_system_file(filepath)) and
+                                    (self.include_hidden_files or not self.is_hidden_file(filepath))):
+                                size = os.path.getsize(filepath)
+                                type_ = os.path.splitext(filename)[1]
+                                date_created = time.ctime(os.path.getctime(filepath))
+                                date_modified = time.ctime(os.path.getmtime(filepath))
 
-        if batch:
-            db_manager.insert_files(batch)  # Insert any remaining files
+                                self.signals.file_found.emit(filename, filepath, size, type_, date_created,
+                                                             date_modified)
+                                count += 1
+                                self.signals.progress.emit(count,
+                                                           1000000)  # Update progress. Total number is a placeholder.
+                        except Exception as e:
+                            pass
+                    self.scan_dir(dirpath)  # Call self.scan_dir with dirpath, not self and path
+                    if self._stop:  # Stop if the stop flag is set
+                        return
 
-        if db_manager:
-            db_manager.close()  # Close the database connection
-
-        self.signals.scan_completed.emit()
-        self.signals.file_scanned.emit(("Total Files Scanned:", total_files))
-
-    @staticmethod
-    def is_hidden_file(file_path):
-        attribute = ctypes.windll.kernel32.GetFileAttributesW(file_path)
-        return attribute == -1 or bool(attribute & 2)  # FILE_ATTRIBUTE_HIDDEN = 2
-
-    @staticmethod
-    def is_system_file(file_path):
-        attribute = ctypes.windll.kernel32.GetFileAttributesW(file_path)
-        return attribute == -1 or bool(attribute & 4)  # FILE_ATTRIBUTE_SYSTEM = 4
+    def stop(self):
+        self._stop = True
 
     def scan_dir(self, path):
-        file_count = 0
         for dirpath, _, filenames in os.walk(path):
-            for filename in filenames:
-                try:
-                    file_path = os.path.join(dirpath, filename)
-                    if not self.checkbox_system_files_state and self.is_system_file(file_path):
-                        continue
-                    if not self.checkbox_hidden_files_state and self.is_hidden_file(file_path):
-                        continue
-                    file_size = os.path.getsize(file_path)
-                    _, file_type = os.path.splitext(filename)
+            if self._stop:
+                return
 
-                    # Yield the file information instead of emitting a signal
-                    yield (filename, file_path, file_size, file_type)
-                    file_count += 1
+            for filename in filenames:
+                if self._stop:
+                    return
+
+                try:
+                    filepath = os.path.join(dirpath, filename)
+                    size = os.path.getsize(filepath)
+                    type_ = os.path.splitext(filename)[1]
+                    date_created = time.ctime(os.path.getctime(filepath))
+                    date_modified = time.ctime(os.path.getmtime(filepath))
+
+                    if not self.include_system_files and self.is_system_file(filepath):
+                        continue
+
+                    if not self.include_hidden_files and self.is_hidden_file(filepath):
+                        continue
+
+                    if self.excluded_extensions and type_ in self.excluded_extensions:
+                        continue
+
+                    if self.size_min is not None and size < self.size_min:
+                        continue
+
+                    self.signals.file_found.emit(filename, filepath, size, type_, date_created, date_modified)
 
                 except (OSError, PermissionError):
                     pass
 
-        return file_count
+    @staticmethod
+    def is_system_file(filepath):
+        return os.path.isfile(filepath) and (os.stat(filepath).st_file_attributes & FILE_ATTRIBUTE_SYSTEM)
+
+    @staticmethod
+    def is_hidden_file(filepath):
+        return os.path.isfile(filepath) and (os.stat(filepath).st_file_attributes & FILE_ATTRIBUTE_HIDDEN)
+
 
 class DatabaseManager:
     def __init__(self, db_path):
         self.conn = sqlite3.connect(db_path)
         self.cursor = self.conn.cursor()
 
-    def create_table(self):
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
                 path TEXT NOT NULL,
                 size INTEGER NOT NULL,
-                type TEXT NOT NULL
+                type TEXT NOT NULL,
+                date_created TEXT NOT NULL,
+                date_modified TEXT NOT NULL
             )
         ''')
         self.conn.commit()
 
-    def insert_files(self, files):
-        with self.conn:
-            self.cursor.executemany('''
-                INSERT INTO files (name, path, size, type) VALUES (?, ?, ?, ?)
-            ''', files)
 
-    def query_files(self, query, order_by='name'):
-        # Validate the 'order_by' parameter
-        allowed_order_by = ['name', 'path', 'size', 'type']
-        if order_by not in allowed_order_by:
-            raise ValueError(f"Invalid order_by value: {order_by}")
-
-        # Perform the SQL query
-        self.cursor.execute(f'''
-            SELECT * FROM files WHERE name LIKE ? ORDER BY {order_by}
-        ''', (f"%{query}%",))
-        return self.cursor.fetchall()
+    def insert_file(self, name, path, size, type_, date_created, date_modified):
+        self.cursor.execute('''
+            INSERT INTO files (name, path, size, type, date_created, date_modified) VALUES (?, ?, ?, ?, ?, ?)
+        ''', (name, path, size, type_, date_created, date_modified))
+        self.conn.commit()
 
     def close(self):
         self.conn.close()
-        print("Database closed")
 
-# Create a Qt application
-app = QApplication(sys.argv)
-
-# Create the main window and show it
+app = QApplication([])
 window = MainWindow()
 window.show()
-
-# Run the Qt application
-sys.exit(app.exec())
+app.exec()
