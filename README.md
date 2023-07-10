@@ -30,4 +30,4 @@ Install the required Python packages:
 
 ##Usage
 Run the ScanSearch application:
-`python main.py`
+`python main3.py`
